@@ -319,6 +319,11 @@ public:
         build->Build();
     }
 
+    /// Moves this pipeline's build ahead of background work, for draws skipped while it builds.
+    void PromoteBuild() const {
+        build->Promote();
+    }
+
     /// Waits up to `timeout` for the build; true when built.
     [[nodiscard]] bool WaitBuilt(std::chrono::microseconds timeout) const {
         return build->WaitFor(timeout);

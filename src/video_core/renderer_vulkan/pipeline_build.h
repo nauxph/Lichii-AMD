@@ -222,6 +222,13 @@ public:
                                [&] { return shared->complete.load(std::memory_order_acquire); });
     }
 
+    /// Moves the build ahead of background work without waiting for it.
+    void Promote() const {
+        if (jobs && !IsBuilt()) {
+            jobs->Promote(handle, VideoCommon::ShaderJobPriority::NeedNow);
+        }
+    }
+
     /// Waits up to `timeout` for the build, without running it on this thread. The worker sets
     /// `complete` under the mutex before notifying, so the wakeup cannot be lost.
     /// @return True when the pipeline is built.

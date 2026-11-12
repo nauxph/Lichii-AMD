@@ -2378,6 +2378,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) {
         if (pipeline->heavy_skipped_draws++ == 0) {
             pipeline->heavy_skip_begin = std::chrono::steady_clock::now();
             ++heavy_skip_counters.pipelines;
+            // No draw waits for it, so it would otherwise build behind the background prebuild.
+            pipeline->PromoteBuild();
         }
         ++heavy_skip_counters.draws;
         heavy_skipped_lookup = true;
