@@ -33,7 +33,9 @@
 
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/literals.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -49,6 +51,7 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
+#include "frontend_common/profile_import.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/main.h"
 #include "network/network.h"
@@ -56,6 +59,7 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
 #include "yuzu_cmd/emu_window/emu_window_sdl3_gl.h"
@@ -71,6 +75,7 @@
 // windows.h needs to be included before shellapi.h
 #include <windows.h>
 #include <shellapi.h>
+#include "common/windows/crash_handler.h"
 #include "common/windows/timer_resolution.h"
 #endif
 
@@ -80,75 +85,6 @@ extern "C" {
 // graphics
 __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
-}
-
-// EDEN_NX2_CRASH_DUMP=<dir>: on an unhandled exception (a real crash; fastmem faults are handled
-// before this), write <dir>/eden-crash-<pid>.dmp. A debugger changes the timing enough to hide
-// some crashes, so this catches them at full speed. dbghelp.dll is loaded only then.
-// Prints a code address as module+offset (resolve with llvm-symbolizer and the module's PDB).
-static void PrintCodeAddress(const char* label, const void* address) {
-    HMODULE module{};
-    char name[MAX_PATH] = "?";
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           static_cast<LPCSTR>(address), &module)) {
-        GetModuleFileNameA(module, name, sizeof(name));
-    }
-    const char* base_name = std::strrchr(name, '\\');
-    std::fprintf(stderr, "  %s %p %s+%#llx\n", label, address, base_name ? base_name + 1 : name,
-                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) -
-                                                 reinterpret_cast<uintptr_t>(module)));
-}
-
-static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* exception) {
-    static std::atomic<bool> written{};
-    const char* directory = std::getenv("EDEN_NX2_CRASH_DUMP");
-    if (directory == nullptr || written.exchange(true)) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    // The faulting address and stack first: they survive even if the dump fails.
-    const EXCEPTION_RECORD& record = *exception->ExceptionRecord;
-    std::fprintf(stderr, "Unhandled exception %#lx on thread %lu, info %#llx %#llx\n",
-                 record.ExceptionCode, GetCurrentThreadId(),
-                 static_cast<unsigned long long>(record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0),
-                 static_cast<unsigned long long>(record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0));
-    PrintCodeAddress("at", record.ExceptionAddress);
-    void* frames[48];
-    const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
-    for (USHORT i = 0; i < count; ++i) {
-        PrintCodeAddress("frame", frames[i]);
-    }
-    std::fflush(stderr);
-    struct ExceptionInformation {
-        DWORD thread_id;
-        EXCEPTION_POINTERS* exception_pointers;
-        BOOL client_pointers;
-    };
-    using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, const ExceptionInformation*,
-                                              const void*, const void*);
-    const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-    const auto write = dbghelp ? reinterpret_cast<MiniDumpWriteDumpFn>(
-                                     GetProcAddress(dbghelp, "MiniDumpWriteDump"))
-                               : nullptr;
-    if (write == nullptr) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    char path[MAX_PATH];
-    std::snprintf(path, sizeof(path), "%s\\eden-crash-%lu.dmp", directory, GetCurrentProcessId());
-    const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                    FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        const ExceptionInformation information{GetCurrentThreadId(), exception, FALSE};
-        // MiniDumpWithThreadInfo; the larger MiniDumpWithIndirectlyReferencedMemory failed on
-        // Eden's address space and left an empty file.
-        const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file, 0x1000,
-                              &information, nullptr, nullptr);
-        const DWORD error = ok ? 0 : GetLastError();
-        CloseHandle(file);
-        std::fprintf(stderr, ok ? "Crash dump written to %s\n" : "Crash dump to %s failed (%#lx)\n",
-                     path, error);
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
 
@@ -478,15 +414,76 @@ static bool EditNup(const Core::LaunchParams& lp) {
     }
 }
 
+/// Hidden test hook (not in --help): builds a game's shader precache file without booting it.
+///   yuzu-cmd --build-warm <game file> <title id hex> <output dir>
+static bool BuildWarm(Core::System& system, int argc, char** argv) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    if (argc < 5) {
+        fmt::print(stderr, "usage: --build-warm <game> <title id> <output dir>\n");
+        return false;
+    }
+    system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
+    const u64 title_id = std::strtoull(argv[3], nullptr, 16);
+    ShaderWarm::BuildOptions options;
+    options.output_dir = Common::FS::ToU8String(argv[4]);
+    std::string last_stage;
+    auto last_print = std::chrono::steady_clock::now();
+    const auto begin = last_print;
+    const auto on_progress = [&](const ShaderWarm::Progress& progress) {
+        const auto now = std::chrono::steady_clock::now();
+        if (progress.stage == last_stage && now - last_print < std::chrono::seconds{5}) {
+            return;
+        }
+        last_stage = progress.stage;
+        last_print = now;
+        fmt::print("{:7.1f} s  {}: {} / {}\n",
+                   std::chrono::duration<double>(now - begin).count(), progress.stage,
+                   progress.done, progress.total);
+        std::fflush(stdout);
+    };
+    const auto result = ShaderWarm::BuildWarmFilesWith(
+        system, Common::FS::ToU8String(argv[2]), title_id, options, on_progress, {});
+    // The error can hold a Windows path: escape it so the summary stays valid JSON.
+    std::string error;
+    for (const char c : result.error) {
+        switch (c) {
+        case '"':
+            error += "\\\"";
+            break;
+        case '\\':
+            error += "\\\\";
+            break;
+        case '\n':
+            error += "\\n";
+            break;
+        case '\r':
+            error += "\\r";
+            break;
+        case '\t':
+            error += "\\t";
+            break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                error += fmt::format("\\u{:04x}", static_cast<unsigned>(c));
+            } else {
+                error += c;
+            }
+            break;
+        }
+    }
+    fmt::print("{{\"ok\": {}, \"error\": \"{}\", \"archives\": {}, \"compute\": {}, "
+               "\"skipped\": {}, \"seconds\": {:.1f}}}\n",
+               result.ok, error, result.archives, result.compute_programs, result.skipped,
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    std::fflush(stdout);
+    return result.ok;
+}
+
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
-#ifdef _WIN32
-    SetUnhandledExceptionFilter(WriteCrashDump);
-#endif
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
-    SdlState* state = new SdlState();
-    *appstate = state;
 
 #ifdef _WIN32
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
@@ -504,9 +501,30 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
 #endif
 
+    try {
+        FrontendCommon::CheckLegacyProfileBeforeConfig();
+    } catch (const std::exception& exception) {
+        fmt::print(stderr, "{}\n", exception.what());
+        return SDL_APP_FAILURE;
+    }
+
+    SdlState* state = new SdlState();
+    *appstate = state;
+
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+#ifdef _WIN32
+    // EDEN_NX2_CRASH_DUMP=<dir> puts the dump somewhere other than the log directory.
+    const char* const crash_dump_dir = std::getenv("EDEN_NX2_CRASH_DUMP");
+    Common::Windows::InstallCrashHandler(
+        crash_dump_dir ? std::filesystem::path{crash_dump_dir}
+                       : Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
+#endif
+
+    if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
+        return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
 
     int option_index = 0;
 #ifdef _WIN32
@@ -587,6 +605,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #endif
 
     state->system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    // Holds the updates and DLC an NX archive brings, as the Qt frontend does.
+    static FileSys::ManualContentProvider manual_provider;
+    state->system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                          &manual_provider);
     state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     state->system.GetFileSystemController().CreateFactories(*state->system.GetFilesystem());
     state->system.GetUserChannel().clear();
@@ -618,6 +640,15 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         if (restarted) {
             std::error_code ec;
             std::filesystem::remove(RestartHandoffPath(), ec);
+        } else if (const auto ram = Common::GetHostRam();
+                   Settings::CurrentProgramIsSwitch2() && Common::IsBelowSwitch2RamMinimum(ram)) {
+            using namespace Common::Literals;
+            fmt::print(stderr,
+                       "Warning: this PC has {:.3g} GB of RAM. Switch 2 games need at least 16 GB, "
+                       "and 32 GB is recommended.\nGames can crash, and can even freeze or crash "
+                       "the whole PC.\nThis setup isn't supported, so please don't open issues or "
+                       "ask for help about crashes on it.\n",
+                       static_cast<f64>(ram.bytes) / f64{1_GiB});
         }
         break; // Expected case
     case Core::SystemResultStatus::ErrorGetLoader:

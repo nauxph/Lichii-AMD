@@ -31,6 +31,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/submission_package.h"
 #include "core/loader/loader.h"
+#include "core/loader/nx.h"
 
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
@@ -233,7 +234,7 @@ QString FormatPatchNameVersions(const FileSys::PatchManager& patch_manager,
     FileSys::VirtualFile update_raw;
     loader.ReadUpdateRaw(update_raw);
     for (const auto& patch : patch_manager.GetPatches(update_raw)) {
-        const bool is_update = patch.name == "Update";
+        const bool is_update = patch.type == FileSys::PatchType::Update;
         if (!updatable && is_update) {
             continue;
         }
@@ -273,7 +274,9 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
         });
 
     FileSys::NACP nacp{};
-    if (file_type == Loader::FileType::NUP &&
+    // An NX tree snapshot, like a NUP, is already the updated game: no patch manager update.
+    if ((file_type == Loader::FileType::NUP ||
+         (file_type == Loader::FileType::NX && !loader.IsRomFSUpdatable())) &&
         loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
         const std::string version_string = nacp.GetVersionString();
         if (!version_string.empty()) {
@@ -434,8 +437,42 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
         if (target == ScanTarget::PopulateGameList &&
             (file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
              file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ ||
-             file_type == Loader::FileType::NUP) &&
+             file_type == Loader::FileType::NUP || file_type == Loader::FileType::NX) &&
             !Loader::IsBootableGameContainer(file, file_type)) {
+            // Update- and DLC-only containers stay hidden. One whose programs cannot be
+            // decrypted is listed so the player sees that keys are missing.
+            const auto status = Loader::GetContainerProgramStatus(file, file_type);
+            const auto reason = Loader::GetResultStatusString(status);
+            if (!Loader::IsMissingKeyStatus(status)) {
+                if (status != Loader::ResultStatus::Success &&
+                    status != Loader::ResultStatus::ErrorNSPMissingProgramNCA &&
+                    status != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS) {
+                    LOG_WARNING(Frontend, "Not listing {}: {}", physical_name, reason);
+                }
+                return;
+            }
+            LOG_WARNING(Frontend, "Listing {} without its content: {}", physical_name, reason);
+
+            const auto file_type_string =
+                QString::fromStdString(Loader::GetFileTypeString(file_type));
+            auto* const path_item = new GameListItemPath(
+                FormatGameName(physical_name), {},
+                QFileInfo(QString::fromStdString(physical_name)).completeBaseName(),
+                file_type_string, 0, 0, {});
+            path_item->setData(tr("%1\nDump current keys from your own console and install them "
+                                  "with Tools > Install Decryption Keys.")
+                                   .arg(QString::fromStdString(reason)),
+                               Qt::ToolTipRole);
+            auto pending = std::make_shared<PendingRow>(QList<QStandardItem*>{
+                path_item,
+                new GameListItem(file_type_string),
+                new GameListItemSize(Common::FS::GetSize(physical_name)),
+                new GameListItemPlayTime(0),
+                new GameListItem(tr("Decryption keys missing")),
+            });
+            RecordEvent([=](GameListModel* model) {
+                model->AddEntry(pending->Release(), parent_dir);
+            });
             return;
         }
 
@@ -447,11 +484,15 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                 provider->AddEntry(FileSys::TitleType::Application,
                                    FileSys::GetCRTypeFromNCAType(FileSys::NCA{file}.GetType()),
                                    program_id, file);
+            } else if (file_type == Loader::FileType::NX) {
+                // An archive brings its own updates and add-ons, whatever the setting.
+                static_cast<Loader::AppLoader_NX&>(*loader).RegisterContent(*provider);
             } else if (Settings::values.ext_content_from_game_dirs.GetValue() &&
                        (file_type == Loader::FileType::XCI ||
                         file_type == Loader::FileType::XCZ ||
                         file_type == Loader::FileType::NSP ||
-                        file_type == Loader::FileType::NSZ)) {
+                        file_type == Loader::FileType::NSZ ||
+                        file_type == Loader::FileType::NUP)) {
                 void(provider->AddEntriesFromContainer(file));
             }
         } else {
@@ -471,6 +512,14 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                     if (const QString loose = LooseExeFSName(physical_name); !loose.isEmpty()) {
                         name = loose.toStdString();
                     }
+                }
+                if ((res3 != Loader::ResultStatus::Success || name.empty() || name == " ") &&
+                    (app_loader->GetFileType() == Loader::FileType::NX ||
+                     app_loader->GetFileType() == Loader::FileType::NUP)) {
+                    // A dump without control data has no title: show the file name.
+                    name = QFileInfo(QString::fromStdString(physical_name))
+                               .completeBaseName()
+                               .toStdString();
                 }
 
                 const FileSys::PatchManager patch{id, system.GetFileSystemController(),

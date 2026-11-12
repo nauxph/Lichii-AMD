@@ -604,6 +604,30 @@ TEST_CASE("Consumed read traps rearm on the next GPU write", "[cpu_readback][rea
     REQUIRE(traps.Arm(c, PAGE * 2));
 }
 
+TEST_CASE("A GPU write notifies the core of its unarmed pages only", "[cpu_readback][read_traps]") {
+    VideoCommon::ReadTrapTracker traps;
+    std::vector<Range> parts;
+    const auto collect = [&](u64 address, u64 size) { parts.emplace_back(address, size); };
+    REQUIRE(traps.Arm(c, PAGE * 4, collect));
+    REQUIRE(parts == std::vector<Range>{{c, PAGE * 4}});
+
+    // CPU reads consumed the second and the last page: a rewrite of the buffer arms just those.
+    traps.Subtract(c + PAGE, PAGE);
+    traps.Subtract(c + PAGE * 3, PAGE);
+    parts.clear();
+    REQUIRE(traps.Arm(c, PAGE * 4, collect));
+    REQUIRE(parts == std::vector<Range>{{c + PAGE, PAGE}, {c + PAGE * 3, PAGE}});
+
+    // A write that also reaches past the armed range notifies the new part.
+    traps.Subtract(c, PAGE);
+    parts.clear();
+    REQUIRE(traps.Arm(c, PAGE * 6, collect));
+    REQUIRE(parts == std::vector<Range>{{c, PAGE}, {c + PAGE * 4, PAGE * 2}});
+    parts.clear();
+    REQUIRE_FALSE(traps.Arm(c, PAGE * 6, collect));
+    REQUIRE(parts.empty());
+}
+
 TEST_CASE("MemoryTracker: a GPU rewrite needs a fresh CPU readback", "[cpu_readback]") {
     RasterizerInterface rasterizer;
     MemoryTracker tracker{rasterizer};
@@ -674,6 +698,29 @@ TEST_CASE("MemoryTracker: FlushCachedWrites batching") {
     REQUIRE(calls[ranges_before_flush] == std::tuple<DAddr, u64, int>{c + PAGE, PAGE * 2, -1});
     REQUIRE(calls[ranges_before_flush + 1] == std::tuple<DAddr, u64, int>{c + PAGE * 4, PAGE, -1});
     REQUIRE(rasterizer.Count() == WORD * 2 / PAGE - 3);
+}
+
+TEST_CASE("MemoryTracker: engine writes leave their pages tracked", "[video_core]") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE);
+    const auto update_calls = rasterizer.UpdateCalls();
+
+    memory_track->MarkRegionAsWrittenTracked(c + PAGE, PAGE * 2);
+    REQUIRE(rasterizer.UpdateCalls() == update_calls);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE);
+    REQUIRE(memory_track->ModifiedCpuRegion(c, WORD * 2) == Range{c + PAGE, c + PAGE * 3});
+
+    memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.UpdateCalls() == update_calls);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE);
+    REQUIRE_FALSE(memory_track->IsRegionCpuModified(c, WORD * 2));
+
+    memory_track->MarkRegionAsWrittenTracked(c + PAGE, PAGE);
+    memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE - 1);
+    REQUIRE(rasterizer.Count(c + PAGE) == 0);
 }
 
 TEST_CASE("MemoryTracker: cached writes preserve tracking counts") {

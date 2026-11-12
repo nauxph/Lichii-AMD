@@ -63,6 +63,8 @@ add_library(core STATIC
     file_sys/content_archive.h
     file_sys/control_metadata.cpp
     file_sys/control_metadata.h
+    file_sys/decrypted_nca.cpp
+    file_sys/decrypted_nca.h
     file_sys/errors.h
     file_sys/fs_directory.h
     file_sys/fs_file.h
@@ -352,6 +354,8 @@ add_library(core STATIC
     hle/kernel/kernel.h
     hle/kernel/memory_types.h
     hle/kernel/message_buffer.h
+    hle/kernel/nx2_thread_stats.cpp
+    hle/kernel/nx2_thread_stats.h
     hle/kernel/physical_core.cpp
     hle/kernel/physical_core.h
     hle/kernel/slab_helpers.h
@@ -403,6 +407,8 @@ add_library(core STATIC
     hle/service/acc/async_context.cpp
     hle/service/acc/async_context.h
     hle/service/acc/errors.h
+    hle/service/acc/nextendo_id_token.cpp
+    hle/service/acc/nextendo_id_token.h
     hle/service/acc/profile_manager.cpp
     hle/service/acc/profile_manager.h
     hle/service/am/am.cpp
@@ -656,6 +662,8 @@ add_library(core STATIC
     hle/service/filesystem/fsp/fs_i_save_data_info_reader.h
     hle/service/filesystem/fsp/fs_i_storage.cpp
     hle/service/filesystem/fsp/fs_i_storage.h
+    hle/service/filesystem/fsp/fs_read_trace.cpp
+    hle/service/filesystem/fsp/fs_read_trace.h
     hle/service/filesystem/fsp/fsp_ldr.cpp
     hle/service/filesystem/fsp/fsp_ldr.h
     hle/service/filesystem/fsp/fsp_pr.cpp
@@ -731,8 +739,12 @@ add_library(core STATIC
     hle/service/kernel_helpers.h
     hle/service/lbl/lbl.cpp
     hle/service/lbl/lbl.h
+    hle/service/ldn/direct_lan.cpp
+    hle/service/ldn/direct_lan.h
     hle/service/ldn/lan_discovery.cpp
     hle/service/ldn/lan_discovery.h
+    hle/service/ldn/lan_protocol.cpp
+    hle/service/ldn/lan_protocol.h
     hle/service/ldn/ldn.cpp
     hle/service/ldn/ldn.h
     hle/service/ldn/ldn_results.h
@@ -839,6 +851,8 @@ add_library(core STATIC
     hle/service/ns/ns.h
     hle/service/ns/ns_results.h
     hle/service/ns/ns_types.h
+    hle/service/ns/font_merge.cpp
+    hle/service/ns/font_merge.h
     hle/service/ns/platform_service_manager.cpp
     hle/service/ns/platform_service_manager.h
     hle/service/ns/query_service.cpp
@@ -1054,6 +1068,8 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_frame_interval.h
+    hle/service/nx2_movie_clock.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
     hle/service/nx2_present_pacer.h
@@ -1088,6 +1104,8 @@ add_library(core STATIC
     hle/service/sockets/bsd.h
     hle/service/sockets/nsd.cpp
     hle/service/sockets/nsd.h
+    hle/service/sockets/nextendo_redirect.cpp
+    hle/service/sockets/nextendo_redirect.h
     hle/service/sockets/sfdnsres.cpp
     hle/service/sockets/sfdnsres.h
     hle/service/sockets/sockets.cpp
@@ -1148,6 +1166,8 @@ add_library(core STATIC
     hle/service/wlan/wlan.h
     internal_network/emu_net_state.cpp
     internal_network/emu_net_state.h
+    internal_network/local_redirect.cpp
+    internal_network/local_redirect.h
     internal_network/network.cpp
     internal_network/network.h
     internal_network/network_interface.cpp
@@ -1176,6 +1196,8 @@ add_library(core STATIC
     loader/nsp.h
     loader/nup.cpp
     loader/nup.h
+    loader/nx.cpp
+    loader/nx.h
     loader/xci.cpp
     loader/xci.h
     memory.cpp
@@ -1251,7 +1273,7 @@ target_link_libraries(core PRIVATE
     RenderDoc::API
     ZLIB::ZLIB)
 
-target_link_libraries(core PUBLIC httplib::httplib zstd::zstd)
+target_link_libraries(core PUBLIC httplib::httplib zstd::zstd nxformat_reader)
 
 if (ENABLE_WEB_SERVICE)
     target_compile_definitions(core PUBLIC ENABLE_WEB_SERVICE)

@@ -30,6 +30,7 @@
 #include "core/loader/nso.h"
 #include "core/loader/nsp.h"
 #include "core/loader/nup.h"
+#include "core/loader/nx.h"
 #include "core/loader/xci.h"
 
 namespace Loader {
@@ -133,6 +134,8 @@ FileType IdentifyFile(FileSys::VirtualFile file) {
         return *xci_type;
     } else if (const auto nup_type = IdentifyFileLoader<AppLoader_NUP>(file)) {
         return *nup_type;
+    } else if (const auto nx_type = IdentifyFileLoader<AppLoader_NX>(file)) {
+        return *nx_type;
     } else if (const auto nro_type = IdentifyFileLoader<AppLoader_NRO>(file)) {
         return *nro_type;
     } else if (const auto nca_type = IdentifyFileLoader<AppLoader_NCA>(file)) {
@@ -184,11 +187,38 @@ bool IsBootableGameContainer(FileSys::VirtualFile file, FileType type, u64 progr
         return false;
     }
 
+    if (type == FileType::NX) {
+        return AppLoader_NX::IsBootable(file);
+    }
+
     if (!IsContainerType(type)) {
         return false;
     }
 
     return HasApplicationProgramContent(OpenContainerAsNsp(file, type, program_id, program_index));
+}
+
+bool IsMissingKeyStatus(ResultStatus status) {
+    return status == ResultStatus::ErrorMissingProductionKeyFile ||
+           status == ResultStatus::ErrorMissingHeaderKey ||
+           status == ResultStatus::ErrorMissingTitlekey ||
+           status == ResultStatus::ErrorMissingTitlekek ||
+           status == ResultStatus::ErrorMissingKeyAreaKey;
+}
+
+ResultStatus GetContainerProgramStatus(FileSys::VirtualFile file, FileType type) {
+    const auto nsp = OpenContainerAsNsp(file, type);
+    if (!nsp) {
+        const bool nsp_shaped = type == FileType::NSP || type == FileType::NSZ ||
+                                type == FileType::XCI || type == FileType::XCZ;
+        return nsp_shaped ? ResultStatus::ErrorBadPFSHeader : ResultStatus::Success;
+    }
+    // Without the header key the title id is unreadable. With it, an update or add-on is no game.
+    const auto status = nsp->GetProgramStatus();
+    if (status != ResultStatus::ErrorMissingHeaderKey && (nsp->GetProgramTitleID() & 0x1800) != 0) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
+    return status;
 }
 
 FileType GuessFromFilename(const std::string& name) {
@@ -213,6 +243,8 @@ FileType GuessFromFilename(const std::string& name) {
         return FileType::NSP;
     else if (extension == "nup")
         return FileType::NUP;
+    else if (extension == "nx")
+        return FileType::NX;
     else if (extension == "nsz")
         return FileType::NSZ;
     else if (extension == "kip")
@@ -240,6 +272,8 @@ std::string GetFileTypeString(FileType type) {
         return "NSZ";
     case FileType::NUP:
         return "NUP";
+    case FileType::NX:
+        return "NX";
     case FileType::KIP:
         return "KIP";
     case FileType::DeconstructedRomDirectory:
@@ -266,15 +300,18 @@ constexpr std::array<const char*, 70> RESULT_MESSAGES{
     "The PFS/HFS partition has a bad header.",
     "The PFS/HFS partition has incorrect size as determined by the header.",
     "The NCA file has a bad header.",
-    "The general keyfile could not be found.",
-    "The NCA Header key could not be found.",
+    "prod.keys could not be found.",
+    "The NCA header key (header_key in prod.keys) is missing.",
     "The NCA Header key is incorrect or the header is invalid.",
     "Support for NCA2-type NCAs is not implemented.",
     "Support for NCA0-type NCAs is not implemented.",
-    "The titlekey for this Rights ID could not be found.",
-    "The titlekek for this crypto revision could not be found.",
+    "The title key for this game is missing. Add it to title.keys, or use a dump that includes "
+    "its ticket.",
+    "The titlekek for this game's key generation is missing from prod.keys. Your keys are older "
+    "than this game.",
     "The Rights ID in the header is invalid.",
-    "The key area key for this application type and crypto revision could not be found.",
+    "The key area key for this game's key generation is missing from prod.keys. Your keys are "
+    "older than this game.",
     "The key area key is incorrect or the section header is invalid.",
     "The titlekey and/or titlekek is incorrect or the section header is invalid.",
     "The XCI file is missing a Program-type NCA.",
@@ -410,6 +447,11 @@ static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileSys::V
     // NUP (NX Package) container format.
     case FileType::NUP:
         return std::make_unique<AppLoader_NUP>(std::move(file));
+
+    // NX game archive.
+    case FileType::NX:
+        return std::make_unique<AppLoader_NX>(system, std::move(file), program_id,
+                                              program_index);
 
     // NX deconstructed ROM directory.
     case FileType::DeconstructedRomDirectory:

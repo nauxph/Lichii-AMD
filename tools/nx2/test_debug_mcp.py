@@ -12,9 +12,12 @@ import tempfile
 import threading
 import unittest
 
-import debug_mcp
-
 HERE = os.path.dirname(os.path.abspath(__file__))
+# -I leaves the script's directory off sys.path.
+sys.path.insert(0, HERE)
+
+import debug_mcp  # noqa: E402
+
 PNG_BYTES = b"\x89PNG fake"
 PNG = base64.b64encode(PNG_BYTES).decode()
 
@@ -101,7 +104,7 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(names, ["status", "frame_times", "screenshot", "log_tail", "log_filter", "capture_frame",
                                  "capture_image", "reject_shaders", "sample", "read_memory",
                                  "search_memory", "read_gpu_memory", "input",
-                                 "input_sequence"])
+                                 "input_sequence", "host_timing"])
         self.assertEqual(self.adapter.handle({"id": 3, "method": "bogus"})["error"]["code"], -32601)
 
     def test_frame_times_is_forwarded(self):

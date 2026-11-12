@@ -14,6 +14,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_back_idle_trace.h"
 
 namespace Tegra::Control {
 
@@ -55,7 +56,8 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
     }
 }
 
-void Scheduler::ResumePending(GPU& gpu) {
+bool Scheduler::ResumePending(GPU& gpu) {
+    bool any_progress = false;
     // Running one channel can release the semaphore another waits for: retry until none moves.
     for (bool progress = true; progress;) {
         progress = false;
@@ -65,20 +67,30 @@ void Scheduler::ResumePending(GPU& gpu) {
             // pending: resuming it again counted as progress forever and the GPU thread never
             // reached its stop request (closing the game hung).
             if (!dma_pusher.system.IsPoweredOn()) {
-                return;
+                return any_progress;
             }
             if (!dma_pusher.HasPendingAcquire() || !dma_pusher.CanResumeAcquire()) {
                 continue;
             }
+            VideoCommon::BackIdleTrace::SetFrontState(
+                VideoCommon::BackIdleTrace::FrontState::Parse);
             BindChannel(gpu, state->bind_id);
             dma_pusher.DispatchCalls();
             progress = true;
+            any_progress = true;
         }
     }
     std::erase_if(pending_channels, [](const auto& state) {
         return !state->payload->dma_pusher.HasPendingAcquire();
     });
     any_pending.store(!pending_channels.empty(), std::memory_order_release);
+    return any_progress;
+}
+
+bool Scheduler::WaitsForListCopy() const {
+    return std::ranges::any_of(pending_channels, [](const auto& state) {
+        return state->payload->dma_pusher.WaitsForListCopy();
+    });
 }
 
 void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {

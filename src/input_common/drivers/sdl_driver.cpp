@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <numbers>
+#include <optional>
 #include "common/logging.h"
 #include "common/math_util.h"
 #include "common/param_package.h"
@@ -13,6 +14,8 @@
 #include "common/thread.h"
 #include "common/vector_math.h"
 #include "input_common/drivers/sdl_driver.h"
+#include "input_common/helpers/dualsense_haptics.h"
+#include "input_common/helpers/rumble_mapping.h"
 
 namespace InputCommon {
 
@@ -75,6 +78,25 @@ SDL_GamepadBinding GetBindingForAxis(const GamepadBindings& bindings, SDL_Gamepa
                current.output.axis.axis == static_cast<SDL_GamepadAxis>(axis);
     });
 }
+
+bool IsWiredDualSense(SDL_Gamepad* gamepad) {
+    return SDL_GetGamepadType(gamepad) == SDL_GAMEPAD_TYPE_PS5 &&
+           SDL_GetGamepadConnectionState(gamepad) == SDL_JOYSTICK_CONNECTION_WIRED;
+}
+
+int CountWiredDualSenses() {
+    int gamepad_count = 0;
+    SDL_JoystickID* gamepads = SDL_GetGamepads(&gamepad_count);
+    int count = 0;
+    for (int i = 0; gamepads != nullptr && i < gamepad_count; ++i) {
+        SDL_Gamepad* gamepad = SDL_GetGamepadFromID(gamepads[i]);
+        if (gamepad != nullptr && IsWiredDualSense(gamepad)) {
+            ++count;
+        }
+    }
+    SDL_free(gamepads);
+    return count;
+}
 } // Anonymous namespace
 
 static bool SDLEventWatcher(void* user_data, SDL_Event* event) {
@@ -99,6 +121,7 @@ public:
             return;
         }
         SDL_Gamepad* controller = sdl_controller.get();
+        last_motion_report = std::chrono::steady_clock::now();
         if (HasMotion()) {
             SDL_SetGamepadSensorEnabled(controller, SDL_SENSOR_ACCEL, false);
             SDL_SetGamepadSensorEnabled(controller, SDL_SENSOR_GYRO, false);
@@ -131,9 +154,24 @@ public:
         return has_gyro || has_accel;
     }
 
+    /// A connected controller with sensors that sent no report for a while: some controllers
+    /// stop reporting when another program (Steam Input) changes their sensor mode, or after
+    /// they reconnect. Returns true when EnableMotion should restart them, backing off up to
+    /// MaxMotionStallRetry while they stay silent.
+    bool IsMotionStalled(std::chrono::steady_clock::time_point now) {
+        std::scoped_lock lock{mutex};
+        if (!sdl_controller || !HasMotion() || now - last_motion_report < motion_stall_retry) {
+            return false;
+        }
+        motion_stall_retry = (std::min)(motion_stall_retry * 2, MaxMotionStallRetry);
+        return true;
+    }
+
     bool UpdateMotion(SDL_GamepadSensorEvent event) {
         constexpr float gravity_constant = 9.80665f;
         std::scoped_lock lock{mutex};
+        last_motion_report = std::chrono::steady_clock::now();
+        motion_stall_retry = InitialMotionStallRetry;
         const u64 sensor_timestamp = event.sensor_timestamp != 0 ? event.sensor_timestamp
                                                                  : event.timestamp;
 
@@ -195,41 +233,60 @@ public:
         return motion;
     }
 
-    bool RumblePlay(const Common::Input::VibrationStatus vibration) {
+    bool RumblePlay(const Common::Input::VibrationStatus& vibration, f32 curve_factor) {
         constexpr u32 rumble_max_duration_ms = 2000;
-        constexpr f32 low_start_sensitivity_limit = 140.0f;
-        constexpr f32 low_width_sensitivity_limit = 400.0f;
-        constexpr f32 high_start_sensitivity_limit = 200.0f;
-        constexpr f32 high_width_sensitivity_limit = 700.0f;
-        // Try to provide some feeling of the frequency by reducing the amplitude depending on it.
-        f32 low_frequency_scale = 1.0f;
-        if (vibration.low_frequency > low_start_sensitivity_limit) {
-            low_frequency_scale =
-                (std::max)(1.0f - (vibration.low_frequency - low_start_sensitivity_limit) /
-                                    low_width_sensitivity_limit,
-                         0.3f);
+        std::scoped_lock lock{rumble_mutex};
+        // Both sides of the emulated controller can land on this pad. Keep each side's latest
+        // vibration and play the stronger of the two on each motor, so one side doesn't
+        // overwrite the other.
+        if (vibration.side != Common::Input::VibrationSide::Right) {
+            side_vibrations[0] = vibration;
         }
-        f32 low_amplitude = vibration.low_amplitude * low_frequency_scale;
-
-        f32 high_frequency_scale = 1.0f;
-        if (vibration.high_frequency > high_start_sensitivity_limit) {
-            high_frequency_scale =
-                (std::max)(1.0f - (vibration.high_frequency - high_start_sensitivity_limit) /
-                                    high_width_sensitivity_limit,
-                         0.3f);
+        if (vibration.side != Common::Input::VibrationSide::Left) {
+            side_vibrations[1] = vibration;
         }
-        f32 high_amplitude = vibration.high_amplitude * high_frequency_scale;
+        const auto map = Settings::values.rumble_frequency_mapping.GetValue()
+                             ? MapRumbleByFrequency
+                             : MapRumbleByBand;
+        const MotorStrengths left = map(side_vibrations[0], curve_factor);
+        const MotorStrengths right = map(side_vibrations[1], curve_factor);
+        const auto low_amplitude = static_cast<u16>((std::max)(left.low, right.low) * 0xFFFF);
+        const auto high_amplitude = static_cast<u16>((std::max)(left.high, right.high) * 0xFFFF);
 
         if (sdl_controller) {
-            return SDL_RumbleGamepad(sdl_controller.get(), static_cast<u16>(low_amplitude),
-                                     static_cast<u16>(high_amplitude), rumble_max_duration_ms);
+            return SDL_RumbleGamepad(sdl_controller.get(), low_amplitude, high_amplitude,
+                                     rumble_max_duration_ms);
         } else if (sdl_joystick) {
-            return SDL_RumbleJoystick(sdl_joystick.get(), static_cast<u16>(low_amplitude),
-                                      static_cast<u16>(high_amplitude),
+            return SDL_RumbleJoystick(sdl_joystick.get(), low_amplitude, high_amplitude,
                                       rumble_max_duration_ms);
         }
 
         return false;
+    }
+
+    /// Plays the vibration on the DualSense haptics. Returns false when the controller uses
+    /// standard rumble instead.
+    bool HapticsPlay(const Common::Input::VibrationStatus& vibration) {
+        if (!UseDualSenseHaptics()) {
+            return false;
+        }
+        haptics.SetVibration(vibration);
+        return true;
+    }
+
+    bool IsHapticsOpen() {
+        std::scoped_lock lock{haptics_mutex};
+        return haptics.IsOpen();
+    }
+
+    /// Closes the haptics when their audio device is removed: SDL keeps feeding the stream to a
+    /// silent zombie device, so standard rumble takes over until the device can be opened again.
+    void CloseHapticsOnDevice(SDL_AudioDeviceID device_id) {
+        std::scoped_lock lock{haptics_mutex};
+        if (haptics.UsesDevice(device_id)) {
+            LOG_INFO(Input, "DualSense haptics audio device removed, using standard rumble");
+            haptics.Close();
+        }
     }
 
     bool HasHDRumble() const {
@@ -306,6 +363,11 @@ public:
     }
 
     void SetSDLJoystick(SDL_Joystick* joystick, SDL_Gamepad* controller) {
+        {
+            std::scoped_lock lock{haptics_mutex};
+            haptics.Close();
+            last_haptics_open_attempt.reset();
+        }
         sdl_joystick.reset(joystick);
         sdl_controller.reset(controller);
     }
@@ -400,6 +462,49 @@ public:
     }
 
 private:
+    bool UseDualSenseHaptics() {
+        if (!Settings::values.enable_dualsense_haptics.GetValue()) {
+            std::scoped_lock lock{haptics_mutex};
+            haptics.Close();
+            last_haptics_open_attempt.reset();
+            return false;
+        }
+        {
+            std::scoped_lock lock{haptics_mutex};
+            if (haptics.IsOpen()) {
+                return true;
+            }
+            // The audio device can show up after the gamepad, so retry occasionally instead of
+            // enumerating audio devices on every rumble call
+            constexpr u64 retry_interval_ms = 5000;
+            const u64 now = SDL_GetTicks();
+            if (last_haptics_open_attempt && now - *last_haptics_open_attempt < retry_interval_ms) {
+                return false;
+            }
+            last_haptics_open_attempt = now;
+        }
+
+        // The haptics audio device is only available over USB. SDL doesn't tell which audio device
+        // belongs to which gamepad, so with more than one wired DualSense use standard rumble.
+        // Gamepads are counted since a second controller's audio device can show up late.
+        // These calls stay outside haptics_mutex: SDL can hold its joystick lock while it sends
+        // the removal event that closes the haptics in SetSDLJoystick.
+        SDL_Gamepad* const gamepad = sdl_controller.get();
+        if (gamepad == nullptr || !IsWiredDualSense(gamepad) || CountWiredDualSenses() != 1) {
+            return false;
+        }
+        {
+            std::scoped_lock lock{haptics_mutex};
+            if (!haptics.Open()) {
+                return false;
+            }
+        }
+
+        // Stop any rumble emulation so it doesn't play on top of the haptics stream
+        SDL_RumbleGamepad(gamepad, 0, 0, 0);
+        return true;
+    }
+
     Common::UUID guid;
     int port;
     std::unique_ptr<SDL_Joystick, decltype(&SDL_CloseJoystick)> sdl_joystick;
@@ -411,6 +516,10 @@ private:
     static constexpr std::size_t MaxMotionRestartThreshold = 200 * 64;
     std::size_t motion_error_count{};
     std::size_t motion_restart_threshold{InitialMotionRestartThreshold};
+    static constexpr std::chrono::milliseconds InitialMotionStallRetry{1000};
+    static constexpr std::chrono::milliseconds MaxMotionStallRetry{8000};
+    std::chrono::steady_clock::time_point last_motion_report{};
+    std::chrono::milliseconds motion_stall_retry{InitialMotionStallRetry};
     bool motion_capabilities_logged{false};
     bool logged_accel{false};
     bool logged_gyro{false};
@@ -419,6 +528,13 @@ private:
     bool has_vibration{false};
     bool is_vibration_tested{false};
     BasicMotion motion;
+
+    std::mutex haptics_mutex;
+    DualSenseHaptics haptics;
+    std::optional<u64> last_haptics_open_attempt;
+
+    std::mutex rumble_mutex;
+    std::array<Common::Input::VibrationStatus, 2> side_vibrations{};
 };
 
 std::shared_ptr<SDLJoystick> SDLDriver::GetSDLJoystickByGUID(const Common::UUID& guid, int port) {
@@ -587,9 +703,25 @@ void SDLDriver::CloseJoystick(SDL_Joystick* sdl_joystick) {
     }
 }
 
-void SDLDriver::PumpEvents() const {
-    if (initialized) {
-        SDL_PumpEvents();
+void SDLDriver::PumpEvents() {
+    if (!initialized) {
+        return;
+    }
+    SDL_PumpEvents();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_motion_stall_check < std::chrono::milliseconds{250}) {
+        return;
+    }
+    last_motion_stall_check = now;
+    std::scoped_lock lock{joystick_map_mutex};
+    for (const auto& [guid, joysticks] : joystick_map) {
+        for (const auto& joystick : joysticks) {
+            if (joystick->IsMotionStalled(now)) {
+                LOG_INFO(Input, "Motion sensor of {} port {} stopped reporting, restarting it",
+                         joystick->GetControllerName(), joystick->GetPort());
+                joystick->EnableMotion();
+            }
+        }
     }
 }
 
@@ -652,6 +784,18 @@ void SDLDriver::HandleGameControllerEvent(const SDL_Event& event) {
         LOG_DEBUG(Input, "Controller connected with device index {}", event.jdevice.which);
         InitJoystick(event.jdevice.which);
         break;
+    case SDL_EVENT_AUDIO_DEVICE_REMOVED: {
+        if (event.adevice.recording) {
+            break;
+        }
+        std::scoped_lock lock{joystick_map_mutex};
+        for (const auto& [guid, joysticks] : joystick_map) {
+            for (const auto& joystick : joysticks) {
+                joystick->CloseHapticsOnDevice(event.adevice.which);
+            }
+        }
+        break;
+    }
     }
 }
 
@@ -789,9 +933,9 @@ Common::Input::DriverResult SDLDriver::SetVibration(
     const PadIdentifier& identifier, const Common::Input::VibrationStatus& vibration) {
     const auto joystick =
         GetSDLJoystickByGUID(identifier.guid.RawString(), static_cast<int>(identifier.port));
-    const auto process_amplitude_exp = [](f32 amplitude, f32 factor) {
-        return (amplitude + std::pow(amplitude, factor)) * 0.5f * 0xFFFF;
-    };
+    if (joystick->HapticsPlay(vibration)) {
+        return Common::Input::DriverResult::Success;
+    }
 
     // Default exponential curve for rumble
     f32 factor = 0.35f;
@@ -806,15 +950,7 @@ Common::Input::DriverResult SDLDriver::SetVibration(
         factor = 1.0f;
     }
 
-    const Common::Input::VibrationStatus new_vibration{
-        .low_amplitude = process_amplitude_exp(vibration.low_amplitude, factor),
-        .low_frequency = vibration.low_frequency,
-        .high_amplitude = process_amplitude_exp(vibration.high_amplitude, factor),
-        .high_frequency = vibration.high_frequency,
-        .type = Common::Input::VibrationAmplificationType::Exponential,
-    };
-
-    joystick->RumblePlay(new_vibration);
+    joystick->RumblePlay(vibration, factor);
 
     return Common::Input::DriverResult::Success;
 }
@@ -824,9 +960,9 @@ bool SDLDriver::IsVibrationEnabled(const PadIdentifier& identifier) {
         GetSDLJoystickByGUID(identifier.guid.RawString(), static_cast<int>(identifier.port));
 
     static constexpr Common::Input::VibrationStatus test_vibration{
-        .low_amplitude = 1,
+        .low_amplitude = 1.0f / 0xFFFF,
         .low_frequency = 160.0f,
-        .high_amplitude = 1,
+        .high_amplitude = 1.0f / 0xFFFF,
         .high_frequency = 320.0f,
         .type = Common::Input::VibrationAmplificationType::Exponential,
     };
@@ -844,18 +980,23 @@ bool SDLDriver::IsVibrationEnabled(const PadIdentifier& identifier) {
     }
 
     // First vibration might fail
-    joystick->RumblePlay(test_vibration);
+    joystick->RumblePlay(test_vibration, 1.0f);
 
     // Wait for about 15ms to ensure the controller is ready for the stop command
     std::this_thread::sleep_for(std::chrono::milliseconds(15));
 
-    if (!joystick->RumblePlay(zero_vibration)) {
+    if (!joystick->RumblePlay(zero_vibration, 1.0f)) {
         joystick->EnableVibration(false);
         return false;
     }
 
     joystick->EnableVibration(true);
     return true;
+}
+
+bool SDLDriver::IsVibrationStreamed(const PadIdentifier& identifier) {
+    const auto joystick = GetSDLJoystickByGUID(identifier.guid, static_cast<int>(identifier.port));
+    return joystick->IsHapticsOpen();
 }
 
 Common::ParamPackage SDLDriver::BuildAnalogParamPackageForButton(int port, const Common::UUID& guid,

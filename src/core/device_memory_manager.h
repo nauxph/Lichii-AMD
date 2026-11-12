@@ -15,6 +15,7 @@
 #include <source_location>
 #include <vector>
 #include <span>
+#include <unordered_map>
 
 #include "common/common_types.h"
 #include "common/range_mutex.h"
@@ -67,10 +68,26 @@ public:
 
     void Unmap(DAddr address, size_t size);
 
+    /// Device pages without memory that keep the bytes written to them until Map gives them
+    /// memory, which then holds those bytes (a Switch 2 sparse block waiting for its memory).
+    /// Reads see the kept bytes meanwhile; Unmap drops them.
+    void KeepWrites(DAddr address, size_t size);
+    /// Read or write [address, +size) when it has kept pages (or pages mapped meanwhile): mapped
+    /// pages as usual, the others from the kept bytes. False, doing nothing that counts, when it
+    /// has neither.
+    bool ReadKept(DAddr address, void* dest_pointer, size_t size);
+    bool WriteKept(DAddr address, const void* src_pointer, size_t size);
+
     void TrackContinuityImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid);
     void TrackContinuity(DAddr address, VAddr virtual_address, size_t size, Asid asid) {
         std::scoped_lock lk(mapping_guard);
         TrackContinuityImpl(address, virtual_address, size, asid);
+    }
+
+    /// Changes whenever Map or Unmap ran: host pointers GetPointer returned before are only good
+    /// while it stays the same.
+    [[nodiscard]] u64 TranslationGeneration() const noexcept {
+        return translation_generation.load(std::memory_order_acquire);
     }
 
     // Write / Read
@@ -245,7 +262,11 @@ private:
         tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
     }
 
-    std::atomic<u64> translation_generation{1}; ///< Bumped by Map and Unmap
+    /// Starts past every earlier manager's: one built where a destroyed one was must not match
+    /// the translations a thread kept for that one (Translations compares owner and generation).
+    static inline std::atomic<u64> next_generation_base{1};
+    /// Bumped by Map and Unmap
+    std::atomic<u64> translation_generation{next_generation_base.fetch_add(1ULL << 32)};
     using CounterType = u8;
     using CounterAtomicType = std::atomic_uint8_t;
     static constexpr size_t subentries = 8 / sizeof(CounterType);
@@ -276,6 +297,12 @@ private:
     std::unique_ptr<CachedPages> cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
+
+    /// Taken before mapping_guard. The pages KeepWrites keeps, by device page; null reads zero.
+    std::mutex kept_mutex;
+    std::atomic<size_t> kept_count{};
+    using KeptPage = std::array<u8, size_t{1} << page_bits>;
+    std::unordered_map<size_t, std::unique_ptr<KeptPage>> kept_pages;
 
 
 };

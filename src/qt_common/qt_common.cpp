@@ -13,6 +13,9 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#ifdef _WIN32
+#include "common/windows/crash_handler.h"
+#endif
 #include "common/scm_rev.h"
 #include "common/cpu_features.h"
 #include "core/memory.h"
@@ -59,7 +62,7 @@ const QStringList supported_file_extensions = {QStringLiteral("nro"), QStringLit
                                                QStringLiteral("nca"), QStringLiteral("xci"),
                                                QStringLiteral("xcz"), QStringLiteral("nsp"),
                                                QStringLiteral("nsz"), QStringLiteral("nup"),
-                                               QStringLiteral("kip")};
+                                               QStringLiteral("nx"),  QStringLiteral("kip")};
 
 Core::Frontend::WindowSystemType GetWindowSystemType() {
     // Determine WSI type based on Qt platform.
@@ -224,6 +227,9 @@ void Init(QWidget* root) {
 
     Common::Log::Initialize();
     Common::Log::Start();
+#ifdef _WIN32
+    Common::Windows::InstallCrashHandler(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
+#endif
 
     Network::Init();
 

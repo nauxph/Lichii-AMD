@@ -125,6 +125,10 @@ public:
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
     /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
     void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
+    /// Constant buffer data to device memory the caller translated (not Switch 2 sparse memory).
+    /// FlushCaching hands the written ranges, merged, to the rasterizer's
+    /// InvalidateConstantBufferData instead of InnerInvalidation.
+    void WriteConstantBufferData(DAddr device_addr, const void* data, std::size_t size);
 
     /**
      * Checks if a gpu region can be simply read with a pointer.
@@ -149,6 +153,11 @@ public:
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> GetSubmappedRange(
         GPUVAddr gpu_addr, std::size_t size) const;
 
+    /// The device ranges [gpu_addr, gpu_addr + size) maps to (contiguous pages merged), up to the
+    /// end of the address space.
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> GetSubmappedDeviceRange(
+        GPUVAddr gpu_addr, std::size_t size) const;
+
     GPUVAddr Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
                  PTEKind kind = PTEKind::INVALID, bool is_big_pages = true);
     GPUVAddr MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages = true);
@@ -167,6 +176,12 @@ public:
 
     [[nodiscard]] u64 MapSerial() const {
         return map_serial.load(std::memory_order_acquire);
+    }
+
+    /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
+    /// a host pointer GetPointer returned is only good while it stays the same.
+    [[nodiscard]] u64 HostPointerSerial() const {
+        return MapSerial() + memory.TranslationGeneration();
     }
 
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).
@@ -216,6 +231,8 @@ private:
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe,
                        std::source_location caller) const;
+    /// A download for a guest read not yet in guest memory would land over this write later.
+    void FinishReadsBefore(DAddr dev_addr, std::size_t size, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
 
     [[nodiscard]] std::size_t PageEntryIndex(GPUVAddr gpu_addr, bool is_big_page) const {
@@ -297,6 +314,7 @@ private:
 
     const size_t unique_identifier;
     VideoCommon::InvalidationAccumulator accumulator;
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> constant_buffer_writes;
 
     static std::atomic<size_t> unique_identifier_generator;
 

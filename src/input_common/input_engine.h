@@ -131,6 +131,11 @@ public:
         return false;
     }
 
+    // Returns true if the device smooths vibrations itself and takes every update
+    virtual bool IsVibrationStreamed([[maybe_unused]] const PadIdentifier& identifier) {
+        return false;
+    }
+
     // Sets polling mode to a controller
     virtual Common::Input::DriverResult SetPollingMode(
         [[maybe_unused]] const PadIdentifier& identifier,
@@ -299,6 +304,14 @@ private:
     mutable std::mutex mutex;
     mutable std::mutex mutex_callback;
     bool configuring{false};
+    /// First motion value of each sensor since mapping began; later values are compared with it
+    /// (sensors reporting hundreds of times a second change too little from one to the next).
+    struct MotionBaseline {
+        PadIdentifier identifier;
+        int motion;
+        BasicMotion value;
+    };
+    std::vector<MotionBaseline> motion_baselines;
     const std::string input_engine;
     int last_callback_key = 0;
     ::Common::unordered_map<PadIdentifier, ControllerData> controller_list;

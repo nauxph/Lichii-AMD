@@ -5,6 +5,7 @@
 // clang-format off
 #include <windows.h>
 #include <sysinfoapi.h>
+#include <psapi.h>
 // clang-format on
 #else
 #include <sys/types.h>
@@ -17,6 +18,15 @@
 #endif
 #endif
 
+#ifdef __linux__
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <string_view>
+#endif
+
+#include "common/literals.h"
 #include "common/memory_detect.h"
 
 namespace Common {
@@ -67,6 +77,73 @@ static MemoryInfo Detect() {
 const MemoryInfo& GetMemInfo() {
     static MemoryInfo mem_info = Detect();
     return mem_info;
+}
+
+HostRam GetHostRam() {
+#ifdef _WIN32
+    ULONGLONG kilobytes{};
+    if (GetPhysicallyInstalledSystemMemory(&kilobytes) && kilobytes != 0) {
+        return {kilobytes * 1024, true};
+    }
+#endif
+#ifdef __APPLE__
+    return {GetMemInfo().TotalPhysicalMemory, true};
+#else
+    return {GetMemInfo().TotalPhysicalMemory, false};
+#endif
+}
+
+bool IsBelowSwitch2RamMinimum(HostRam ram) {
+    using namespace Common::Literals;
+    return ram.bytes != 0 && ram.bytes < (ram.installed ? 16_GiB : 12_GiB);
+}
+
+ProcessMemoryUsage GetProcessMemoryUsage() {
+    ProcessMemoryUsage usage{};
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX2 counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        usage.commit = counters.PrivateUsage;
+        usage.working_set = counters.WorkingSetSize;
+        usage.private_working_set = counters.PrivateWorkingSetSize;
+    }
+    PERFORMANCE_INFORMATION performance{};
+    performance.cb = sizeof(performance);
+    if (GetPerformanceInfo(&performance, sizeof(performance))) {
+        usage.system_commit = u64{performance.CommitTotal} * performance.PageSize;
+        usage.system_commit_limit = u64{performance.CommitLimit} * performance.PageSize;
+    }
+#elif defined(__linux__)
+    std::ifstream status{"/proc/self/status"};
+    for (std::string line; std::getline(status, line);) {
+        const auto field = [&line](std::string_view key) -> u64 {
+            if (!line.starts_with(key)) {
+                return 0;
+            }
+            return std::strtoull(line.c_str() + key.size(), nullptr, 10) << 10;
+        };
+        usage.commit = (std::max)(usage.commit, field("VmData:"));
+        usage.working_set = (std::max)(usage.working_set, field("VmRSS:"));
+        usage.private_working_set = (std::max)(usage.private_working_set, field("RssAnon:"));
+    }
+#endif
+    return usage;
+}
+
+std::optional<u64> GetSystemCommitRoom() {
+#ifdef _WIN32
+    PERFORMANCE_INFORMATION performance{};
+    performance.cb = sizeof(performance);
+    if (GetPerformanceInfo(&performance, sizeof(performance))) {
+        const u64 limit = performance.CommitLimit;
+        const u64 committed = performance.CommitTotal;
+        return (committed < limit ? limit - committed : 0) * performance.PageSize;
+    }
+#endif
+    return std::nullopt;
 }
 
 } // namespace Common

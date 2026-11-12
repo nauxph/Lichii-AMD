@@ -119,6 +119,18 @@ struct WordManager {
         }
     }
 
+    /// ChangeRegionState(Type::CPU, true, ...) leaving the pages tracked (Untracked unchanged):
+    /// pages tracked now stay tracked, so clearing the bits later tracks nothing again.
+    void MarkWrittenTracked(u64 dirty_addr, u64 size) noexcept {
+        std::span<u64> cpu_words = Span(Type::CPU);
+        std::span<u64> cached_words = Span(Type::CachedCPU);
+        IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+            cpu_words[index] |= mask;
+            cached_words[index] &= ~mask;
+            NoteCleanWord(index);
+        });
+    }
+
     /// @brief Change the state of a range of pages
     /// @param type          Type of the page
     /// @param enable        If enabling or disabling
@@ -181,6 +193,11 @@ struct WordManager {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;
+            if (word == 0 &&
+                (!clear || ((type != Type::CPU && type != Type::CachedCPU) ||
+                            (untracked_words[index] & mask) == 0))) {
+                return;
+            }
             if (clear) {
                 if (type == Type::CPU || type == Type::CachedCPU) {
                     CollectChangedRanges(true, index, untracked_words[index], mask, ranges);

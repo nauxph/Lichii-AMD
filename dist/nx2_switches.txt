@@ -1,8 +1,8 @@
 # Switch NX2 - read when the Lichii GUI starts.
 # One NAME=VALUE per line. Lines starting with # are ignored.
 # A variable already set in the environment wins over this file.
-# Between files, the user copy (%APPDATA%\eden\nx2_switches.txt, or
-# $XDG_CONFIG_HOME/eden/nx2_switches.txt) wins over this one, so editing this file is never
+# Between files, the user copy (%APPDATA%\lichii\nx2_switches.txt, or
+# $XDG_CONFIG_HOME/lichii/nx2_switches.txt) wins over this one, so editing this file is never
 # needed: copy the lines you want into your own and restart.
 # Beside-application files accept EDEN_NX2_* and the emulator's diagnostic switches only.
 # Host environment settings, including library paths such as EDEN_STREAMLINE_DIR, must be
@@ -25,9 +25,6 @@ EDEN_NX2_FLUSH_DRAWS=128
 # vanished on about half of the frames on AMD without it. Costs about 0.05 ms a frame.
 EDEN_NX2_RP_BARRIER=1
 
-# No emulated 40 MB/s card speed for game file reads (PR #278): Ocarina's movies keep up with
-# their sound.
-EDEN_NX2_FS_READ_MBPS=0
 
 # Leave off on AMD: preflushing GPU writes turns Ocarina's water and grass black.
 #EDEN_NX2_PREFLUSH=1
